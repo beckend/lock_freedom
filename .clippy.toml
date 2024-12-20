@@ -1,0 +1,6 @@
+disallowed-types = [
+  # When errors occurs, countless accumulated hours will be spent on debugging.
+  # Use [fs-err](https://crates.io/crates/fs-err) instead.
+  "std::fs",
+  "tokio::fs",
+]

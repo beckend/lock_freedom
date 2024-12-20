@@ -5,6 +5,7 @@ can open an issue as well. I am open to discuss anything :D
 But BEWARE! You will face the dark arts of unsafe Rust!
 
 # Documentation
+
 If you write any method, iterator, data structure or whatever, you are not
 required to write any documentation. However, writing documentation helps me
 (or any other person) to understand what is its purpouse. But don't worry,
@@ -12,6 +13,7 @@ if you did not wrote any documentation and I need more info, I am going to
 ask for the info.
 
 # Testing
+
 Besides writing unit tests, if you wrote anything sensitive or with `unsafe`
 keyword, I would like you to write a new fuzz test. To add a new fuzz test,
 just execute `cargo fuzz add <your_test_name>`, and to run
@@ -22,4 +24,5 @@ You can look at other fuzz tests as examples. To pass a flag to libfuzzer, use
 the environmental variable LFUZ_OPTIONS.
 
 # Formatting
+
 Use the configuration file `.rustfmt.toml` at the root of the project.

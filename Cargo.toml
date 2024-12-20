@@ -1,25 +1,36 @@
 [package]
-name = "lock_freedom"
-version = "0.1.0"
-authors = ["Wyatt Jacob Herkamp <wherkamp@kingtux.me>", "Bruno Corrêa Zimmermann <brunoczim@gmail.com>"]
+authors = [
+  "Wyatt Jacob Herkamp <wherkamp@kingtux.me>",
+  "Bruno Corrêa Zimmermann <brunoczim@gmail.com>",
+]
+categories = [
+  "concurrency",
+  "data-structures",
+  "algorithms",
+]
 description = "This crate provides concurrent data structures and a solution to the ABA problem as an alternative of hazard pointers"
-repository = "https://github.com/wyatt-herkamp/lock_freedom"
-keywords = ["concurrency", "lock-free", "atomics", "data-structures"]
-categories = ["concurrency", "data-structures", "algorithms"]
-license = "MIT"
-readme = "README.md"
 edition = "2021"
-rust-version = "1.60.0"
+keywords = [
+  "concurrency",
+  "lock-free",
+  "atomics",
+  "data-structures",
+]
+license = "MIT"
+name = "lock_freedom"
+readme = "README.md"
+repository = "https://github.com/wyatt-herkamp/lock_freedom"
+rust-version = "1.83"
+version = "0.1.0"
 [dependencies]
 
 [[bench]]
-name = "map"
 harness = false
+name    = "map"
 
 [dev-dependencies]
-criterion = "0.3"
+criterion = "0.5.1"
 
 [features]
 default = ["std"]
-std = []
-
+std     = []
