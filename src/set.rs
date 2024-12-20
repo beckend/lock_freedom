@@ -36,6 +36,18 @@ impl<T> Set<T> {
 }
 
 impl<T, H> Set<T, H> {
+  /// Returns the number of elements in the [`Set`].
+  pub fn len(&self) -> usize {
+    self.inner.len()
+  }
+
+  /// Returns whether the [`Set`] is empty.
+  pub fn is_empty(&self) -> bool {
+    self.inner.is_empty()
+  }
+}
+
+impl<T, H> Set<T, H> {
   /// Creates an iterator over guarded references to the elements.
   pub fn iter(&self) -> Iter<T> {
     self.into_iter()
@@ -128,6 +140,7 @@ where
       },
       on_retry,
     );
+
     match result {
       MapInsertion::Created => Ok(()),
       MapInsertion::Failed((elem, _)) => Err(elem),
@@ -700,10 +713,19 @@ mod test {
   }
 
   #[test]
-  fn inserts_and_removes() {
+  fn inserts_and_removes_len() {
     let set = Set::new();
+
+    assert_eq!(set.len(), 0);
+    assert!(set.is_empty());
+
     assert!(set.remove(&7, yield_now).is_none());
+    assert_eq!(set.len(), 0);
+    assert!(set.is_empty());
     set.insert(7, yield_now).unwrap();
+    assert_eq!(set.len(), 1);
+    assert!(!set.is_empty());
+
     assert_eq!(set.remove(&7, yield_now).unwrap(), 7);
     assert!(set.remove(&7, yield_now).is_none());
     set.insert(3, yield_now).unwrap();
@@ -712,6 +734,9 @@ mod test {
     assert_eq!(set.remove(&3, yield_now).unwrap(), 3);
     assert!(set.remove(&3, yield_now).is_none());
     assert!(set.remove(&5, yield_now).is_none());
+
+    assert_eq!(set.len(), 0);
+    assert!(set.is_empty());
   }
 
   #[test]

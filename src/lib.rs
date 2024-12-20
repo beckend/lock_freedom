@@ -35,6 +35,11 @@ extern crate alloc;
 /// Common utilities.
 pub mod common;
 
+/// A read guard.
+pub mod guard_read_queue;
+/// A read guard.
+pub mod guard_read_stack;
+
 pub(crate) mod owned_alloc;
 /// Provides convenient re-exports.
 pub mod prelude;

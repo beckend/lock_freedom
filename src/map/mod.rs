@@ -24,6 +24,7 @@ use core::{
   hash::{BuildHasher, Hash},
   iter::FromIterator,
   mem,
+  sync::atomic::{self, AtomicUsize},
 };
 use std::collections::hash_map::RandomState;
 
@@ -62,9 +63,10 @@ use std::collections::hash_map::RandomState;
 /// values, as they must be deinitialized correctly. Instead, we return guarded
 /// references to the entries and wrappers over removed entries.
 pub struct Map<K, V, H = RandomState> {
-  top: OwnedAlloc<Table<K, V>>,
-  incin: SharedIncin<K, V>,
   builder: H,
+  incin: SharedIncin<K, V>,
+  length: AtomicUsize,
+  top: OwnedAlloc<Table<K, V>>,
 }
 
 impl<K, V> Map<K, V> {
@@ -78,6 +80,18 @@ impl<K, V> Map<K, V> {
   /// Creates the [`Map`] using the given shared incinerator.
   pub fn with_incin(incin: SharedIncin<K, V>) -> Self {
     Self::with_hasher_and_incin(RandomState::default(), incin)
+  }
+}
+
+impl<K, V, H> Map<K, V, H> {
+  /// Returns the number of entries in the map.
+  pub fn len(&self) -> usize {
+    self.length.load(atomic::Ordering::Acquire)
+  }
+
+  /// Returns `true` if the map is empty or `false` otherwise.
+  pub fn is_empty(&self) -> bool {
+    self.len() == 0
   }
 }
 
@@ -129,9 +143,10 @@ where
   /// incinerator.
   pub fn with_hasher_and_incin(builder: H, incin: SharedIncin<K, V>) -> Self {
     Self {
-      top: Table::new_alloc(),
-      incin,
       builder,
+      incin,
+      length: Default::default(),
+      top: Table::new_alloc(),
     }
   }
 
@@ -182,7 +197,10 @@ where
     };
 
     match insertion {
-      Insertion::Created => None,
+      Insertion::Created => {
+        self.length.fetch_add(1, atomic::Ordering::AcqRel);
+        None
+      }
       Insertion::Updated(old) => Some(old),
       Insertion::Failed(_) => unreachable!(),
     }
@@ -223,7 +241,10 @@ where
     };
 
     match insertion {
-      Insertion::Created => Insertion::Created,
+      Insertion::Created => {
+        self.length.fetch_add(1, atomic::Ordering::AcqRel);
+        Insertion::Created
+      }
       Insertion::Updated(old) => Insertion::Updated(old),
       Insertion::Failed(inserter) => Insertion::Failed(inserter.into_pair()),
     }
@@ -263,7 +284,10 @@ where
     };
 
     match insertion {
-      Insertion::Created => Insertion::Created,
+      Insertion::Created => {
+        self.length.fetch_add(1, atomic::Ordering::AcqRel);
+        Insertion::Created
+      }
       Insertion::Updated(old) => Insertion::Updated(old),
       Insertion::Failed(_) => unreachable!(),
     }
@@ -315,7 +339,10 @@ where
     };
 
     match insertion {
-      Insertion::Created => Insertion::Created,
+      Insertion::Created => {
+        self.length.fetch_add(1, atomic::Ordering::AcqRel);
+        Insertion::Created
+      }
       Insertion::Updated(old) => Insertion::Updated(old),
       Insertion::Failed(inserter) => Insertion::Failed(inserter.into_removed()),
     }
@@ -355,11 +382,17 @@ where
     let hash = self.hash_of(key);
     let pause = self.incin.get_unchecked().pause(on_retry);
     // Safe because we paused properly.
-    unsafe {
+    let removed = unsafe {
       self
         .top
         .remove(key, interactive, hash, &pause, self.incin.get_unchecked())
+    };
+
+    if removed.is_some() {
+      self.length.fetch_sub(1, atomic::Ordering::AcqRel);
     }
+
+    removed
   }
 
   /// Acts just like [`Extend::extend`] but does not require mutability.
@@ -540,8 +573,23 @@ mod test {
   }
 
   #[test]
+  fn len_is_empty() {
+    let map = Map::new();
+
+    assert_eq!(map.len(), 0);
+    assert!(map.is_empty());
+
+    map.insert("five".to_owned(), 5, yield_now);
+
+    assert_eq!(map.len(), 1);
+    assert!(!map.is_empty());
+  }
+
+  #[test]
   fn create() {
     let map = Map::new();
+    assert_eq!(map.len(), 0);
+
     assert!(map
       .insert_with(
         "five".to_owned(),
@@ -553,7 +601,13 @@ mod test {
         yield_now
       )
       .created());
+
+    assert_eq!(map.len(), 1);
+
     assert_eq!(*map.get("five", yield_now).unwrap().val(), 5);
+
+    assert_eq!(map.len(), 1);
+
     assert!(map
       .insert_with(
         "five".to_owned(),
@@ -566,11 +620,16 @@ mod test {
       )
       .failed()
       .is_some());
+
+    assert_eq!(map.len(), 1);
   }
 
   #[test]
   fn update() {
     let map = Map::new();
+
+    assert_eq!(map.len(), 0);
+
     assert!(map
       .insert_with(
         "five".to_owned(),
@@ -585,7 +644,13 @@ mod test {
       )
       .failed()
       .is_some());
+
+    assert_eq!(map.len(), 0);
+
     assert!(map.insert("five".to_owned(), 5, yield_now).is_none());
+
+    assert_eq!(map.len(), 1);
+
     let guard = map
       .insert_with(
         "five".to_owned(),
@@ -600,6 +665,9 @@ mod test {
       )
       .take_updated()
       .unwrap();
+
+    assert_eq!(map.len(), 1);
+
     assert_eq!(guard.key(), "five");
     assert_eq!(*guard.val(), 5);
     assert_eq!(*map.get("five", yield_now).unwrap().val(), 12);

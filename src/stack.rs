@@ -1,16 +1,17 @@
-use crate::{common::noop, owned_alloc::OwnedAlloc};
+use crate::{common::noop, guard_read_stack::GuardRead, owned_alloc::OwnedAlloc};
 use core::{
   fmt,
   iter::FromIterator,
   mem::ManuallyDrop,
   ptr::{null_mut, NonNull},
-  sync::atomic::{AtomicPtr, Ordering::*},
+  sync::atomic::{AtomicPtr, AtomicUsize, Ordering::*},
 };
 
 /// A lock-free stack. LIFO/FILO semanthics are fully respected.
 pub struct Stack<T> {
-  top: AtomicPtr<Node<T>>,
   incin: SharedIncin<T>,
+  length: AtomicUsize,
+  top: AtomicPtr<Node<T>>,
 }
 
 impl<T> Stack<T> {
@@ -22,8 +23,9 @@ impl<T> Stack<T> {
   /// Creates an empty queue using the passed shared incinerator.
   pub fn with_incin(incin: SharedIncin<T>) -> Self {
     Self {
-      top: AtomicPtr::new(null_mut()),
       incin,
+      length: AtomicUsize::default(),
+      top: AtomicPtr::new(null_mut()),
     }
   }
 
@@ -51,6 +53,7 @@ impl<T> Stack<T> {
         .compare_exchange(target.next, new_top, Release, Relaxed)
       {
         Ok(_) => {
+          self.length.fetch_add(1, AcqRel);
           // Let's be sure we do not deallocate the pointer.
           target.into_raw();
           break;
@@ -62,9 +65,9 @@ impl<T> Stack<T> {
   }
 
   /// Pops a single element from the top of the stack.
-  pub fn pop(&self, on_retry: impl FnMut()) -> Option<T> {
+  pub fn pop(&self, mut on_retry: impl FnMut() + Clone) -> Option<T> {
     // We need this because of ABA problem and use-after-free.
-    let pause = self.incin.get_unchecked().pause(on_retry);
+    let pause = self.incin.get_unchecked().pause(on_retry.clone());
     // First, let's load our top.
     let mut top = self.top.load(Acquire);
 
@@ -92,12 +95,40 @@ impl<T> Stack<T> {
           // Safe because we already removed the node and we are
           // adding to the incinerator rather than
           // dropping it directly.
+          self.length.fetch_sub(1, AcqRel);
           pause.add_to_incin(unsafe { OwnedAlloc::from_raw(nnptr) });
           break Some(val);
         }
 
         Err(new_top) => top = new_top,
+      };
+
+      on_retry();
+    }
+  }
+
+  /// Peek at a single element from the top of the stack. Returns a guard, nothing is removed.
+  pub fn top_peek(&self, mut on_retry: impl FnMut() + Clone) -> Option<GuardRead<T>> {
+    // We need this because of ABA problem and use-after-free.
+    let pause = self.incin.get_unchecked().pause(on_retry.clone());
+    // First, let's load our top.
+    let mut top = self.top.load(Acquire);
+
+    loop {
+      // If top is null, we have nothing. Try operator (?) handles it.
+      let nnptr = NonNull::new(top)?;
+
+      if let Err(new_top) =
+        self
+          .top
+          .fetch_update(AcqRel, Acquire, |x| if x == top { Some(top) } else { None })
+      {
+        top = new_top;
+      } else {
+        return Some(GuardRead::new(pause, nnptr));
       }
+
+      on_retry();
     }
   }
 
@@ -110,6 +141,18 @@ impl<T> Stack<T> {
     for elem in iterable {
       self.push(elem);
     }
+  }
+}
+
+impl<T> Stack<T> {
+  /// Returns the number of elements in the stack.
+  pub fn len(&self) -> usize {
+    self.length.load(Acquire)
+  }
+
+  /// Returns `true` if the stack is empty otherwise `false`.
+  pub fn is_empty(&self) -> bool {
+    self.len() == 0
   }
 }
 
@@ -211,8 +254,8 @@ impl<T> fmt::Debug for SharedIncin<T> {
 }
 
 #[derive(Debug)]
-struct Node<T> {
-  val: ManuallyDrop<T>,
+pub(crate) struct Node<T> {
+  pub(crate) val: ManuallyDrop<T>,
   next: *mut Node<T>,
 }
 
@@ -250,6 +293,38 @@ mod test {
   }
 
   #[test]
+  fn length_is_empty() {
+    let stack = Stack::new();
+    assert_eq!(stack.len(), 0);
+    assert!(stack.is_empty());
+    stack.push(3);
+    stack.push(1234);
+
+    assert_eq!(stack.len(), 2);
+    assert!(!stack.is_empty());
+
+    stack.pop(yield_now);
+    assert_eq!(stack.len(), 1);
+    stack.pop(yield_now);
+    assert_eq!(stack.len(), 0);
+  }
+
+  #[test]
+  fn top_peek() {
+    let stack = Stack::new();
+
+    stack.push(3);
+    stack.push(1234);
+    assert_eq!(stack.len(), 2);
+
+    let guard = stack.top_peek(yield_now).expect("This must work.");
+    assert_eq!(stack.len(), 2);
+    assert_eq!(*guard, 1234);
+    assert_eq!(stack.pop(yield_now), Some(1234));
+    assert_eq!(stack.len(), 1);
+  }
+
+  #[test]
   fn order() {
     let stack = Stack::new();
     stack.push(4);
@@ -264,33 +339,34 @@ mod test {
   #[cfg(feature = "std")]
   #[test]
   fn no_data_corruption() {
-    use std::{sync::Arc, thread};
+    use std::sync::Arc;
+    use std::thread;
 
     const NTHREAD: usize = 20;
     const NITER: usize = 800;
     const NMOD: usize = 55;
 
     let stack = Arc::new(Stack::new());
-    let mut handles = Vec::with_capacity(NTHREAD);
 
-    for i in 0..NTHREAD {
-      let stack = stack.clone();
-      handles.push(thread::spawn(move || {
-        for j in 0..NITER {
-          let val = (i * NITER) + j;
-          stack.push(val);
-          if (val + 1) % NMOD == 0 {
-            if let Some(val) = stack.pop(yield_now) {
-              assert!(val < NITER * NTHREAD);
+    thread::scope(|s| {
+      for i in 0..NTHREAD {
+        s.spawn({
+          let stack = stack.clone();
+
+          move || {
+            for j in 0..NITER {
+              let val = (i * NITER) + j;
+              stack.push(val);
+              if (val + 1) % NMOD == 0 {
+                if let Some(val) = stack.pop(yield_now) {
+                  assert!(val < NITER * NTHREAD);
+                }
+              }
             }
           }
-        }
-      }));
-    }
-
-    for handle in handles {
-      handle.join().expect("thread failed");
-    }
+        });
+      }
+    });
 
     let expected = NITER * NTHREAD - NITER * NTHREAD / NMOD;
     let mut res = 0;
@@ -300,5 +376,64 @@ mod test {
     }
 
     assert_eq!(res, expected);
+  }
+
+  #[cfg(feature = "std")]
+  #[test]
+  fn stability() {
+    use std::sync::Arc;
+    use std::thread;
+
+    use crate::set::Set;
+
+    const NTHREAD: usize = 500 * 20;
+    const NITER: usize = 800;
+
+    let stack = Arc::new(Stack::new());
+    let set = Arc::new(Set::new());
+
+    thread::scope(|s| {
+      for i in 0..NTHREAD {
+        s.spawn({
+          let stack = stack.clone();
+
+          move || {
+            for j in 0..NITER {
+              stack.push(format!("{i}_{j}"));
+            }
+          }
+        });
+
+        s.spawn({
+          let stack = stack.clone();
+          let set = set.clone();
+
+          move || {
+            for _ in 0..NITER {
+              loop {
+                if let Some(val) = stack.pop(yield_now) {
+                  set.insert(val, yield_now).unwrap();
+                  break;
+                }
+
+                yield_now();
+              }
+            }
+          }
+        });
+
+        s.spawn({
+          let stack = stack.clone();
+
+          move || {
+            for _ in 0..NITER {
+              stack.top_peek(yield_now);
+            }
+          }
+        });
+      }
+    });
+
+    assert_eq!(set.len(), NTHREAD * NITER);
   }
 }

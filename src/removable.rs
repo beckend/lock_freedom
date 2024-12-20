@@ -67,6 +67,15 @@ impl<T> Removable<T> {
     }
   }
 
+  /// Tries to get a  reference to the stored value. If the value was not present, `None` is returned.
+  pub fn get_ref(&self) -> Option<&T> {
+    if self.present.load(Acquire) {
+      unsafe { Some(self.item.assume_init_ref()) }
+    } else {
+      None
+    }
+  }
+
   /// Tries to get a mutable reference to the stored value. If the value was
   /// not present, `None` is returned.
   pub fn get_mut(&mut self) -> Option<&mut T> {

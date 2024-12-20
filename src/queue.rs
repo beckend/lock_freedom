@@ -1,10 +1,12 @@
 use crate::common::noop;
+use crate::guard_read_queue::GuardRead;
 use crate::owned_alloc::OwnedAlloc;
 use crate::{
   incin::Pause,
   ptr::{bypass_null, check_null_align},
   removable::Removable,
 };
+use core::sync::atomic::AtomicUsize;
 use core::{
   fmt,
   iter::FromIterator,
@@ -15,9 +17,10 @@ use core::{
 /// A lock-free general-purpouse queue. FIFO semanthics are fully respected.
 /// It can be used as multi-producer and multi-consumer channel.
 pub struct Queue<T> {
-  front: AtomicPtr<Node<T>>,
   back: AtomicPtr<Node<T>>,
+  front: AtomicPtr<Node<T>>,
   incin: SharedIncin<T>,
+  length: AtomicUsize,
 }
 
 impl<T> Queue<T> {
@@ -31,10 +34,12 @@ impl<T> Queue<T> {
   pub fn with_incin(incin: SharedIncin<T>) -> Self {
     let node = Node::new(Removable::empty());
     let sentinel = OwnedAlloc::new(node).into_raw().as_ptr();
+
     Self {
-      front: AtomicPtr::new(sentinel),
       back: AtomicPtr::new(sentinel),
+      front: AtomicPtr::new(sentinel),
       incin,
+      length: Default::default(),
     }
   }
 
@@ -58,17 +63,20 @@ impl<T> Queue<T> {
     let node_ptr = alloc.into_raw().as_ptr();
     // Swap with the previously stored back.
     let prev_back = self.back.swap(node_ptr, AcqRel);
+
     unsafe {
       // Updates the previous back's next field to our newly allocated
       // node. This may delay the visibility of the insertion.
       (*prev_back).next.store(node_ptr, Release);
     }
+
+    self.length.fetch_add(1, AcqRel);
   }
 
   /// Takes a value from the front of the queue, if it is available.
-  pub fn pop(&self, on_retry: impl FnMut()) -> Option<T> {
+  pub fn pop(&self, mut on_retry: impl FnMut() + Clone) -> Option<T> {
     // Pausing because of ABA problem involving remotion from linked lists.
-    let pause = self.incin.get_unchecked().pause(on_retry);
+    let pause = self.incin.get_unchecked().pause(on_retry.clone());
     let mut front_nnptr = unsafe {
       // The pointer stored in front and back must never be null. The
       // queue always have at least one node. Front and back are
@@ -86,6 +94,7 @@ impl<T> Queue<T> {
           // Safe to call because we passed a pointer from the front
           // which was loaded during the very same pause we are
           // passing.
+          self.length.fetch_sub(1, AcqRel);
           unsafe { self.try_clear_first(front_nnptr, &pause) };
           break Some(val);
         }
@@ -96,7 +105,35 @@ impl<T> Queue<T> {
         None => unsafe {
           front_nnptr = self.try_clear_first(front_nnptr, &pause)?;
         },
+      };
+
+      on_retry();
+    }
+  }
+
+  /// Peek the first element of the queue. Returns a guard, no elements are removed.
+  pub fn pop_peek(&self, mut on_retry: impl FnMut() + Clone) -> Option<GuardRead<T>> {
+    // Pausing because of ABA problem involving remotion from linked lists.
+    let pause = self.incin.get_unchecked().pause(on_retry.clone());
+    let mut front_nnptr = unsafe {
+      // The pointer stored in front and back must never be null. The
+      // queue always have at least one node. Front and back are
+      // always connected.
+      bypass_null(self.front.load(Relaxed))
+    };
+
+    loop {
+      let has_item = unsafe { front_nnptr.as_ref().item.get_ref().is_some() };
+
+      if has_item {
+        return GuardRead::new(pause, front_nnptr).into();
       }
+
+      unsafe {
+        front_nnptr = self.try_clear_first(front_nnptr, &pause)?;
+      }
+
+      on_retry();
     }
   }
 
@@ -226,6 +263,18 @@ impl<T> Iterator for Queue<T> {
   }
 }
 
+impl<T> Queue<T> {
+  /// Gets the length of the queue.
+  pub fn len(&self) -> usize {
+    self.length.load(Acquire)
+  }
+
+  /// Checks if the queue is empty.
+  pub fn is_empty(&self) -> bool {
+    self.len() == 0
+  }
+}
+
 impl<T> fmt::Debug for Queue<T> {
   fn fmt(&self, fmtr: &mut fmt::Formatter) -> fmt::Result {
     write!(
@@ -273,9 +322,10 @@ impl<T> fmt::Debug for SharedIncin<T> {
   }
 }
 
+/// A node in the queue.
 #[repr(align(/* at least */ 2))]
-struct Node<T> {
-  item: Removable<T>,
+pub struct Node<T> {
+  pub(crate) item: Removable<T>,
   next: AtomicPtr<Node<T>>,
 }
 
@@ -294,7 +344,6 @@ impl<T> Node<T> {
 mod test {
   use super::*;
   use alloc::sync::Arc;
-  use alloc::vec::Vec;
   use core::sync::atomic::AtomicUsize;
   use std::thread::yield_now;
 
@@ -327,6 +376,36 @@ mod test {
   }
 
   #[test]
+  fn length_is_empty() {
+    let instance = Queue::new();
+    assert_eq!(instance.len(), 0);
+    assert!(instance.is_empty());
+
+    instance.push(3);
+    assert_eq!(instance.len(), 1);
+
+    instance.pop(yield_now);
+    assert_eq!(instance.len(), 0);
+  }
+
+  #[test]
+  fn pop_peek() {
+    let instance = Queue::new();
+
+    instance.push(3);
+    instance.push(1234);
+    assert_eq!(instance.len(), 2);
+
+    let guard = instance.pop_peek(yield_now).expect("This must work.");
+    assert_eq!(instance.len(), 2);
+
+    assert_eq!(*guard, 3);
+    assert_eq!(instance.pop(yield_now), Some(3));
+    assert_eq!(instance.pop(yield_now), Some(1234));
+    assert_eq!(instance.len(), 0);
+  }
+
+  #[test]
   fn queue_iter() {
     let mut queue = Queue::new();
     queue.push(3);
@@ -341,35 +420,33 @@ mod test {
   #[cfg(feature = "std")]
   #[test]
   fn no_data_corruption() {
-    use std::thread::{self, yield_now};
+    use std::thread::scope;
+
     const NTHREAD: usize = 20;
     const NITER: usize = 800;
     const NMOD: usize = 55;
 
     let queue = Arc::new(Queue::new());
-    let mut handles = Vec::with_capacity(NTHREAD);
     let removed = Arc::new(AtomicUsize::new(0));
 
-    for i in 0..NTHREAD {
-      let removed = removed.clone();
-      let queue = queue.clone();
-      handles.push(thread::spawn(move || {
-        for j in 0..NITER {
-          let val = (i * NITER) + j;
-          queue.push(val);
-          if (val + 1) % NMOD == 0 {
-            if let Some(val) = queue.pop(yield_now) {
-              removed.fetch_add(1, Relaxed);
-              assert!(val < NITER * NTHREAD);
+    scope(|s| {
+      for i in 0..NTHREAD {
+        let removed = removed.clone();
+        let queue = queue.clone();
+        s.spawn(move || {
+          for j in 0..NITER {
+            let val = (i * NITER) + j;
+            queue.push(val);
+            if (val + 1) % NMOD == 0 {
+              if let Some(val) = queue.pop(yield_now) {
+                removed.fetch_add(1, Relaxed);
+                assert!(val < NITER * NTHREAD);
+              }
             }
           }
-        }
-      }));
-    }
-
-    for handle in handles {
-      handle.join().expect("thread failed");
-    }
+        });
+      }
+    });
 
     let expected = NITER * NTHREAD - removed.load(Relaxed);
     let mut res = 0;
@@ -379,5 +456,64 @@ mod test {
     }
 
     assert_eq!(res, expected);
+  }
+
+  #[cfg(feature = "std")]
+  #[test]
+  fn stability() {
+    use std::sync::Arc;
+    use std::thread;
+
+    use crate::set::Set;
+
+    const NTHREAD: usize = 500 * 20;
+    const NITER: usize = 800;
+
+    let instance = Arc::new(Queue::new());
+    let set = Arc::new(Set::new());
+
+    thread::scope(|s| {
+      for i in 0..NTHREAD {
+        s.spawn({
+          let instance = instance.clone();
+
+          move || {
+            for j in 0..NITER {
+              instance.push(format!("{i}_{j}"));
+            }
+          }
+        });
+
+        s.spawn({
+          let instance = instance.clone();
+          let set = set.clone();
+
+          move || {
+            for _ in 0..NITER {
+              loop {
+                if let Some(val) = instance.pop(yield_now) {
+                  set.insert(val, yield_now).unwrap();
+                  break;
+                }
+
+                yield_now();
+              }
+            }
+          }
+        });
+
+        s.spawn({
+          let instance = instance.clone();
+
+          move || {
+            for _ in 0..NITER {
+              instance.pop_peek(yield_now);
+            }
+          }
+        });
+      }
+    });
+
+    assert_eq!(set.len(), NTHREAD * NITER);
   }
 }
