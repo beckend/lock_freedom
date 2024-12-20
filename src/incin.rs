@@ -1,4 +1,4 @@
-use crate::tls::ThreadLocal;
+use crate::{common::noop, tls::ThreadLocal};
 use alloc::vec::Vec;
 use core::{
   cell::Cell,
@@ -49,7 +49,7 @@ use core::{
 ///             let loaded = state.load(SeqCst);
 ///             let new = unsafe { *loaded + i };
 ///             state.swap(Box::into_raw(Box::new(new)), SeqCst)
-///         });
+///         }, thread::yield_now);
 ///
 ///         // dropping
 ///         incin.add(unsafe { Box::from_raw(ptr) })
@@ -82,7 +82,7 @@ impl<T> Incinerator<T> {
   /// incinerator. Only after creating the pause you should perform atomic
   /// operations such as `load` and any other operation affected by ABA
   /// problem. This operation performs [`AcqRel`] on the pause counter.
-  pub fn pause(&self) -> Pause<T> {
+  pub fn pause(&self, mut on_retry: impl FnMut()) -> Pause<T> {
     let mut count = self.counter.load(Relaxed);
     loop {
       // Sanity check.
@@ -106,6 +106,8 @@ impl<T> Incinerator<T> {
 
         Err(new) => count = new,
       }
+
+      on_retry();
     }
   }
 
@@ -114,11 +116,11 @@ impl<T> Incinerator<T> {
   /// whole ABA-problem-suffering cycle of `load` and `compare_and_swap`
   /// inside the closure. See documentation for [`Incinerator::pause`] and
   /// `Pause::resume` for more details.
-  pub fn pause_with<F, A>(&self, exec: F) -> A
+  pub fn pause_with<F, A>(&self, exec: F, on_retry: impl FnMut()) -> A
   where
     F: FnOnce(&Pause<T>) -> A,
   {
-    let pause = self.pause();
+    let pause = self.pause(on_retry);
     let ret = exec(&pause);
     pause.resume();
     ret
@@ -185,7 +187,7 @@ where
   _unsync: PhantomData<*mut ()>,
 }
 
-impl<'incin, T> Pause<'incin, T> {
+impl<T> Pause<'_, T> {
   /// Returns the incinerator on which this pause acts.
   pub fn incin(&self) -> &Incinerator<T> {
     self.incin
@@ -221,7 +223,7 @@ impl<'incin, T> Pause<'incin, T> {
   pub fn resume(self) {}
 }
 
-impl<'incin, T> Drop for Pause<'incin, T> {
+impl<T> Drop for Pause<'_, T> {
   fn drop(&mut self) {
     if self.incin.counter.fetch_sub(1, AcqRel) == 1 {
       // If the previous value was 1, this means now it is 0 and... we can
@@ -231,13 +233,13 @@ impl<'incin, T> Drop for Pause<'incin, T> {
   }
 }
 
-impl<'incin, T> Clone for Pause<'incin, T> {
+impl<T> Clone for Pause<'_, T> {
   fn clone(&self) -> Self {
-    self.incin.pause()
+    self.incin.pause(noop)
   }
 }
 
-unsafe impl<'incin, T> Send for Pause<'incin, T> where T: Send {}
+unsafe impl<T> Send for Pause<'_, T> where T: Send {}
 
 struct GarbageList<T> {
   list: Cell<Vec<T>>,

@@ -718,7 +718,7 @@ where
   curr: Option<&'map mut List<K, V>>,
 }
 
-impl<'map, K, V> IterMut<'map, K, V> {
+impl<K, V> IterMut<'_, K, V> {
   pub fn empty() -> Self {
     Self { curr: None }
   }
@@ -751,7 +751,7 @@ impl<'map, K, V> Iterator for IterMut<'map, K, V> {
   }
 }
 
-impl<'map, K, V> fmt::Debug for IterMut<'map, K, V> {
+impl<K, V> fmt::Debug for IterMut<'_, K, V> {
   fn fmt(&self, fmtr: &mut fmt::Formatter) -> fmt::Result {
     match self.curr {
       Some(_) => fmtr.write_str("Some(_)"),

@@ -1,6 +1,9 @@
-use crate::map::{
-  Insertion as MapInsertion, IntoIter as MapIntoIter, Iter as MapIter, Map, Preview,
-  ReadGuard as MapGuard, Removed as MapRemoved, SharedIncin as MapIncin,
+use crate::{
+  common::noop,
+  map::{
+    Insertion as MapInsertion, IntoIter as MapIntoIter, Iter as MapIter, Map, Preview,
+    ReadGuard as MapGuard, Removed as MapRemoved, SharedIncin as MapIncin,
+  },
 };
 use core::{
   borrow::Borrow,
@@ -86,12 +89,12 @@ where
   /// a type resulted from borrowing the stored element. This method will
   /// only work correctly if [`Hash`] and [`Ord`] are implemented in the same
   /// way for the borrowed type and the stored type.
-  pub fn contains<U>(&self, elem: &U) -> bool
+  pub fn contains<U>(&self, elem: &U, on_retry: impl FnMut()) -> bool
   where
     U: Hash + Ord,
     T: Borrow<U>,
   {
-    self.inner.get(elem).is_some()
+    self.inner.get(elem, on_retry).is_some()
   }
 
   /// Returns a guarded reference to the given element in the [`Set`]. This
@@ -100,27 +103,31 @@ where
   /// only work correctly if [`Hash`] and [`Ord`] are implemented in the same
   /// way for the borrowed type and the stored type. If the element is not
   /// found, [`None`] is obviously returned.
-  pub fn get<'set, U>(&'set self, elem: &U) -> Option<ReadGuard<'set, T>>
+  pub fn get<'set, U>(&'set self, elem: &U, on_retry: impl FnMut()) -> Option<ReadGuard<'set, T>>
   where
     U: Hash + Ord,
     T: Borrow<U>,
   {
-    self.inner.get(elem).map(ReadGuard::new)
+    self.inner.get(elem, on_retry).map(ReadGuard::new)
   }
 
   /// Inserts the element into the [`Set`]. If the element was already
   /// present, [`Err`]`(the_passed_value)` is returned.
-  pub fn insert(&self, elem: T) -> Result<(), T>
+  pub fn insert(&self, elem: T, on_retry: impl FnMut()) -> Result<(), T>
   where
     T: Hash + Ord,
   {
-    let result = self.inner.insert_with(elem, |_, _, stored| {
-      if stored.is_some() {
-        Preview::Discard
-      } else {
-        Preview::New(())
-      }
-    });
+    let result = self.inner.insert_with(
+      elem,
+      |_, _, stored| {
+        if stored.is_some() {
+          Preview::Discard
+        } else {
+          Preview::New(())
+        }
+      },
+      on_retry,
+    );
     match result {
       MapInsertion::Created => Ok(()),
       MapInsertion::Failed((elem, _)) => Err(elem),
@@ -133,18 +140,27 @@ where
   /// closure is the element passed to `insert_with` and the second is the
   /// stored found element, if any. The closure returns whether the insertion
   /// should go on. This method is useful for types with metadata.
-  pub fn insert_with<F>(&self, elem: T, mut interactive: F) -> Insertion<T, T>
+  pub fn insert_with<F>(
+    &self,
+    elem: T,
+    mut interactive: F,
+    on_retry: impl FnMut(),
+  ) -> Insertion<T, T>
   where
     F: FnMut(&T, Option<&T>) -> bool,
     T: Hash + Ord,
   {
-    let result = self.inner.insert_with(elem, |elem, _, stored| {
-      if interactive(elem, stored.map(|(elem, _)| elem)) {
-        Preview::New(())
-      } else {
-        Preview::Discard
-      }
-    });
+    let result = self.inner.insert_with(
+      elem,
+      |elem, _, stored| {
+        if interactive(elem, stored.map(|(elem, _)| elem)) {
+          Preview::New(())
+        } else {
+          Preview::Discard
+        }
+      },
+      on_retry,
+    );
 
     match result {
       MapInsertion::Created => Insertion::Created,
@@ -162,13 +178,13 @@ where
   ///
   /// If the removed element does not fit any category, the insertion will
   /// fail. Otherwise, insertion cannot fail.
-  pub fn reinsert(&self, elem: Removed<T>) -> Result<(), Removed<T>>
+  pub fn reinsert(&self, elem: Removed<T>, on_retry: impl FnMut()) -> Result<(), Removed<T>>
   where
     T: Hash + Ord,
   {
     let result = self
       .inner
-      .reinsert_with(elem.inner, |_, stored| stored.is_none());
+      .reinsert_with(elem.inner, |_, stored| stored.is_none(), on_retry);
     match result {
       MapInsertion::Created => Ok(()),
       MapInsertion::Failed(removed) => Err(Removed::new(removed)),
@@ -189,14 +205,21 @@ where
   ///
   /// If the removed element does not fit any category, the insertion will
   /// fail. Otherwise, insertion cannot fail.
-  pub fn reinsert_with<F>(&self, elem: Removed<T>, mut interactive: F) -> Insertion<T, Removed<T>>
+  pub fn reinsert_with<F>(
+    &self,
+    elem: Removed<T>,
+    mut interactive: F,
+    on_retry: impl FnMut(),
+  ) -> Insertion<T, Removed<T>>
   where
     F: FnMut(&T, Option<&T>) -> bool,
     T: Hash + Ord,
   {
-    let result = self.inner.reinsert_with(elem.inner, |(elem, _), stored| {
-      interactive(elem, stored.map(|(elem, _)| elem))
-    });
+    let result = self.inner.reinsert_with(
+      elem.inner,
+      |(elem, _), stored| interactive(elem, stored.map(|(elem, _)| elem)),
+      on_retry,
+    );
 
     match result {
       MapInsertion::Created => Insertion::Created,
@@ -209,12 +232,12 @@ where
   /// type resulted from borrowing the stored element. This method will only
   /// work correctly if [`Hash`] and [`Ord`] are implemented in the same way
   /// for the borrowed type and the stored type.
-  pub fn remove<U>(&self, elem: &U) -> Option<Removed<T>>
+  pub fn remove<U>(&self, elem: &U, on_retry: impl FnMut()) -> Option<Removed<T>>
   where
     U: Hash + Ord,
     T: Borrow<U>,
   {
-    self.inner.remove(elem).map(Removed::new)
+    self.inner.remove(elem, on_retry).map(Removed::new)
   }
 
   /// Removes _interactively_ the given element. A closure is passed to
@@ -224,7 +247,12 @@ where
   /// borrowing the stored element. This method will only work correctly
   /// if [`Hash`] and [`Ord`] are implemented in the same way for the borrowed
   /// type and the stored type.
-  pub fn remove_with<U, F>(&self, elem: &U, mut interactive: F) -> Option<Removed<T>>
+  pub fn remove_with<U, F>(
+    &self,
+    elem: &U,
+    mut interactive: F,
+    on_retry: impl FnMut(),
+  ) -> Option<Removed<T>>
   where
     U: Hash + Ord,
     T: Borrow<U>,
@@ -232,7 +260,7 @@ where
   {
     self
       .inner
-      .remove_with(elem, |(elem, _)| interactive(elem))
+      .remove_with(elem, |(elem, _)| interactive(elem), on_retry)
       .map(Removed::new)
   }
 
@@ -244,7 +272,7 @@ where
     T: Hash + Ord,
   {
     for val in iterable {
-      self.insert(val);
+      self.insert(val, noop);
     }
   }
 }
@@ -393,7 +421,7 @@ impl<'set, T> ReadGuard<'set, T> {
   }
 }
 
-impl<'set, T> Deref for ReadGuard<'set, T> {
+impl<T> Deref for ReadGuard<'_, T> {
   type Target = T;
 
   fn deref(&self) -> &T {
@@ -401,7 +429,7 @@ impl<'set, T> Deref for ReadGuard<'set, T> {
   }
 }
 
-impl<'set, T> fmt::Debug for ReadGuard<'set, T>
+impl<T> fmt::Debug for ReadGuard<'_, T>
 where
   T: fmt::Debug,
 {
@@ -410,7 +438,7 @@ where
   }
 }
 
-impl<'set, T> fmt::Display for ReadGuard<'set, T>
+impl<T> fmt::Display for ReadGuard<'_, T>
 where
   T: fmt::Display,
 {
@@ -419,7 +447,7 @@ where
   }
 }
 
-impl<'set, T> PartialEq<T> for ReadGuard<'set, T>
+impl<T> PartialEq<T> for ReadGuard<'_, T>
 where
   T: PartialEq,
 {
@@ -428,7 +456,7 @@ where
   }
 }
 
-impl<'set, T> PartialOrd<T> for ReadGuard<'set, T>
+impl<T> PartialOrd<T> for ReadGuard<'_, T>
 where
   T: PartialOrd,
 {
@@ -437,13 +465,13 @@ where
   }
 }
 
-impl<'set, T> Borrow<T> for ReadGuard<'set, T> {
+impl<T> Borrow<T> for ReadGuard<'_, T> {
   fn borrow(&self) -> &T {
     self.deref()
   }
 }
 
-impl<'set, T> AsRef<T> for ReadGuard<'set, T> {
+impl<T> AsRef<T> for ReadGuard<'_, T> {
   fn as_ref(&self) -> &T {
     self.deref()
   }
@@ -617,6 +645,7 @@ mod test {
   use std::{
     cmp::Ordering,
     hash::{Hash, Hasher},
+    thread::yield_now,
   };
 
   #[derive(Debug, Clone, Copy)]
@@ -657,62 +686,64 @@ mod test {
   #[test]
   fn inserts_and_contains_checks() {
     let set = Set::new();
-    assert!(!set.contains(&3));
-    assert!(!set.contains(&5));
-    set.insert(3).unwrap();
-    assert!(set.contains(&3));
-    assert!(!set.contains(&5));
-    set.insert(3).unwrap_err();
-    assert!(set.contains(&3));
-    assert!(!set.contains(&5));
-    set.insert(5).unwrap();
-    assert!(set.contains(&3));
-    assert!(set.contains(&5));
+    assert!(!set.contains(&3, yield_now));
+    assert!(!set.contains(&5, yield_now));
+    set.insert(3, yield_now).unwrap();
+    assert!(set.contains(&3, yield_now));
+    assert!(!set.contains(&5, yield_now));
+    set.insert(3, yield_now).unwrap_err();
+    assert!(set.contains(&3, yield_now));
+    assert!(!set.contains(&5, yield_now));
+    set.insert(5, yield_now).unwrap();
+    assert!(set.contains(&3, yield_now));
+    assert!(set.contains(&5, yield_now));
   }
 
   #[test]
   fn inserts_and_removes() {
     let set = Set::new();
-    assert!(set.remove(&7).is_none());
-    set.insert(7).unwrap();
-    assert_eq!(set.remove(&7).unwrap(), 7);
-    assert!(set.remove(&7).is_none());
-    set.insert(3).unwrap();
-    set.insert(5).unwrap();
-    assert_eq!(set.remove(&5).unwrap(), 5);
-    assert_eq!(set.remove(&3).unwrap(), 3);
-    assert!(set.remove(&3).is_none());
-    assert!(set.remove(&5).is_none());
+    assert!(set.remove(&7, yield_now).is_none());
+    set.insert(7, yield_now).unwrap();
+    assert_eq!(set.remove(&7, yield_now).unwrap(), 7);
+    assert!(set.remove(&7, yield_now).is_none());
+    set.insert(3, yield_now).unwrap();
+    set.insert(5, yield_now).unwrap();
+    assert_eq!(set.remove(&5, yield_now).unwrap(), 5);
+    assert_eq!(set.remove(&3, yield_now).unwrap(), 3);
+    assert!(set.remove(&3, yield_now).is_none());
+    assert!(set.remove(&5, yield_now).is_none());
   }
 
   #[test]
   fn inserts_and_reinserts() {
     let set = Set::new();
-    set.insert(9).unwrap();
-    set.insert(7).unwrap();
-    set.insert(0).unwrap();
-    let removed = set.remove(&9).unwrap();
-    set.reinsert(removed).unwrap();
-    set.insert(9).unwrap_err();
+    set.insert(9, yield_now).unwrap();
+    set.insert(7, yield_now).unwrap();
+    set.insert(0, yield_now).unwrap();
+    let removed = set.remove(&9, yield_now).unwrap();
+    set.reinsert(removed, yield_now).unwrap();
+    set.insert(9, yield_now).unwrap_err();
   }
 
   #[test]
   fn insert_with() {
     let set = Set::new();
-    set.insert(EqI { i: 32, j: 0 }).unwrap();
-    set.insert(EqI { i: 34, j: 10 }).unwrap();
-    set.insert(EqI { i: 34, j: 6 }).unwrap_err();
+    set.insert(EqI { i: 32, j: 0 }, yield_now).unwrap();
+    set.insert(EqI { i: 34, j: 10 }, yield_now).unwrap();
+    set.insert(EqI { i: 34, j: 6 }, yield_now).unwrap_err();
     set
-      .insert_with(EqI { i: 34, j: 6 }, |_, _| true)
+      .insert_with(EqI { i: 34, j: 6 }, |_, _| true, yield_now)
       .updated()
       .unwrap();
     set
-      .insert_with(EqI { i: 34, j: 2 }, |_, _| false)
+      .insert_with(EqI { i: 34, j: 2 }, |_, _| false, yield_now)
       .failed()
       .unwrap();
-    assert!(set.insert_with(EqI { i: 33, j: 2 }, |_, _| true).created());
+    assert!(set
+      .insert_with(EqI { i: 33, j: 2 }, |_, _| true, yield_now)
+      .created());
     set
-      .insert_with(EqI { i: 32, j: 3 }, |_, _| true)
+      .insert_with(EqI { i: 32, j: 3 }, |_, _| true, yield_now)
       .updated()
       .unwrap();
   }
@@ -720,21 +751,23 @@ mod test {
   #[test]
   fn reinsert_with() {
     let set = Set::new();
-    set.insert(EqI { i: 32, j: 0 }).unwrap();
-    set.insert(EqI { i: 34, j: 10 }).unwrap();
-    set.insert(EqI { i: 34, j: 6 }).unwrap_err();
-    let removed_34 = set.remove(&EqI { i: 34, j: 325 }).unwrap();
-    let removed_32 = set.remove(&EqI { i: 32, j: 534 }).unwrap();
+    set.insert(EqI { i: 32, j: 0 }, yield_now).unwrap();
+    set.insert(EqI { i: 34, j: 10 }, yield_now).unwrap();
+    set.insert(EqI { i: 34, j: 6 }, yield_now).unwrap_err();
+    let removed_34 = set.remove(&EqI { i: 34, j: 325 }, yield_now).unwrap();
+    let removed_32 = set.remove(&EqI { i: 32, j: 534 }, yield_now).unwrap();
 
-    set.insert(EqI { i: 34, j: 6 }).unwrap();
+    set.insert(EqI { i: 34, j: 6 }, yield_now).unwrap();
     set
-      .reinsert_with(removed_34, |_, _| true)
+      .reinsert_with(removed_34, |_, _| true, yield_now)
       .updated()
       .unwrap();
     let removed_32 = set
-      .reinsert_with(removed_32, |_, _| false)
+      .reinsert_with(removed_32, |_, _| false, yield_now)
       .take_failed()
       .unwrap();
-    assert!(set.reinsert_with(removed_32, |_, _| true).created());
+    assert!(set
+      .reinsert_with(removed_32, |_, _| true, yield_now)
+      .created());
   }
 }

@@ -1,4 +1,4 @@
-use crate::owned_alloc::OwnedAlloc;
+use crate::{common::noop, owned_alloc::OwnedAlloc};
 use core::{
   fmt,
   iter::FromIterator,
@@ -62,9 +62,9 @@ impl<T> Stack<T> {
   }
 
   /// Pops a single element from the top of the stack.
-  pub fn pop(&self) -> Option<T> {
+  pub fn pop(&self, on_retry: impl FnMut()) -> Option<T> {
     // We need this because of ABA problem and use-after-free.
-    let pause = self.incin.get_unchecked().pause();
+    let pause = self.incin.get_unchecked().pause(on_retry);
     // First, let's load our top.
     let mut top = self.top.load(Acquire);
 
@@ -185,15 +185,15 @@ where
   stack: &'stack Stack<T>,
 }
 
-impl<'stack, T> Iterator for PopIter<'stack, T> {
+impl<T> Iterator for PopIter<'_, T> {
   type Item = T;
 
   fn next(&mut self) -> Option<Self::Item> {
-    self.stack.pop()
+    self.stack.pop(noop)
   }
 }
 
-impl<'stack, T> fmt::Debug for PopIter<'stack, T> {
+impl<T> fmt::Debug for PopIter<'_, T> {
   fn fmt(&self, fmtr: &mut fmt::Formatter) -> fmt::Result {
     write!(fmtr, "PopIter {{ stack: {:?} }}", self.stack)
   }
@@ -229,12 +229,14 @@ impl<T> Node<T> {
 // via fuzzing
 #[cfg(test)]
 mod test {
+  use std::thread::yield_now;
+
   use super::*;
 
   #[test]
   fn on_empty_first_pop_is_none() {
     let stack = Stack::<usize>::new();
-    assert!(stack.pop().is_none());
+    assert!(stack.pop(yield_now).is_none());
   }
 
   #[test]
@@ -242,9 +244,9 @@ mod test {
     let stack = Stack::new();
     stack.push(3);
     stack.push(1234);
-    stack.pop();
-    stack.pop();
-    assert!(stack.pop().is_none());
+    stack.pop(yield_now);
+    stack.pop(yield_now);
+    assert!(stack.pop(yield_now).is_none());
   }
 
   #[test]
@@ -254,9 +256,9 @@ mod test {
     stack.push(3);
     stack.push(5);
     stack.push(6);
-    assert_eq!(stack.pop(), Some(6));
-    assert_eq!(stack.pop(), Some(5));
-    assert_eq!(stack.pop(), Some(3));
+    assert_eq!(stack.pop(yield_now), Some(6));
+    assert_eq!(stack.pop(yield_now), Some(5));
+    assert_eq!(stack.pop(yield_now), Some(3));
   }
 
   #[cfg(feature = "std")]
@@ -278,7 +280,7 @@ mod test {
           let val = (i * NITER) + j;
           stack.push(val);
           if (val + 1) % NMOD == 0 {
-            if let Some(val) = stack.pop() {
+            if let Some(val) = stack.pop(yield_now) {
               assert!(val < NITER * NTHREAD);
             }
           }
@@ -292,7 +294,7 @@ mod test {
 
     let expected = NITER * NTHREAD - NITER * NTHREAD / NMOD;
     let mut res = 0;
-    while let Some(val) = stack.pop() {
+    while let Some(val) = stack.pop(yield_now) {
       assert!(val < NITER * NTHREAD);
       res += 1;
     }

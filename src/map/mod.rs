@@ -16,12 +16,12 @@ use self::{
   insertion::{InsertNew, Reinsert},
   table::Table,
 };
-use crate::owned_alloc::OwnedAlloc;
 use crate::ptr::check_null_align;
+use crate::{common::noop, owned_alloc::OwnedAlloc};
 use core::{
   borrow::Borrow,
   fmt,
-  hash::{BuildHasher, Hash, Hasher},
+  hash::{BuildHasher, Hash},
   iter::FromIterator,
   mem,
 };
@@ -152,24 +152,24 @@ where
   /// work correctly if [`Hash`] and [`Ord`] are implemented in the same way
   /// for the borrowed type and the stored type. If the entry was not
   /// found, [`None`] is returned.
-  pub fn get<'map, Q>(&'map self, key: &Q) -> Option<ReadGuard<'map, K, V>>
+  pub fn get<'map, Q>(&'map self, key: &Q, on_retry: impl FnMut()) -> Option<ReadGuard<'map, K, V>>
   where
     Q: ?Sized + Hash + Ord,
     K: Borrow<Q>,
   {
     let hash = self.hash_of(key);
-    let pause = self.incin.get_unchecked().pause();
+    let pause = self.incin.get_unchecked().pause(on_retry);
     // Safe because we paused properly.
     unsafe { self.top.get(key, hash, pause) }
   }
 
   /// Inserts unconditionally the given key and value. If there was a
   /// previously stored value, it is returned.
-  pub fn insert(&self, key: K, val: V) -> Option<Removed<K, V>>
+  pub fn insert(&self, key: K, val: V, on_retry: impl FnMut()) -> Option<Removed<K, V>>
   where
     K: Hash + Ord,
   {
-    let pause = self.incin.get_unchecked().pause();
+    let pause = self.incin.get_unchecked().pause(on_retry);
     let hash = self.hash_of(&key);
     // Safe because we paused properly.
     let insertion = unsafe {
@@ -200,13 +200,18 @@ where
   /// entry. Obviously, if no stored entry was found, it is `None`. The return
   /// value of the closure is a specification of "what to do with the
   /// insertion now".
-  pub fn insert_with<F>(&self, key: K, interactive: F) -> Insertion<K, V, (K, Option<V>)>
+  pub fn insert_with<F>(
+    &self,
+    key: K,
+    interactive: F,
+    on_retry: impl FnMut(),
+  ) -> Insertion<K, V, (K, Option<V>)>
   where
     K: Hash + Ord,
     F: FnMut(&K, Option<&mut V>, Option<&(K, V)>) -> Preview<V>,
   {
     let hash = self.hash_of(&key);
-    let pause = self.incin.get_unchecked().pause();
+    let pause = self.incin.get_unchecked().pause(on_retry);
     // Safe because we paused properly.
     let insertion = unsafe {
       self.top.insert(
@@ -232,7 +237,11 @@ where
   ///
   /// If the removed entry does not fit any category, the insertion will fail.
   /// Otherwise, insertion cannot fail.
-  pub fn reinsert(&self, mut removed: Removed<K, V>) -> Insertion<K, V, Removed<K, V>>
+  pub fn reinsert(
+    &self,
+    mut removed: Removed<K, V>,
+    on_retry: impl FnMut(),
+  ) -> Insertion<K, V, Removed<K, V>>
   where
     K: Hash + Ord,
   {
@@ -242,7 +251,7 @@ where
 
     let hash = self.hash_of(removed.key());
 
-    let pause = self.incin.get_unchecked().pause();
+    let pause = self.incin.get_unchecked().pause(on_retry);
     // Safe because we paused properly.
     let insertion = unsafe {
       self.top.insert(
@@ -282,6 +291,7 @@ where
     &self,
     mut removed: Removed<K, V>,
     interactive: F,
+    on_retry: impl FnMut(),
   ) -> Insertion<K, V, Removed<K, V>>
   where
     K: Hash + Ord,
@@ -293,7 +303,7 @@ where
 
     let hash = self.hash_of(removed.key());
 
-    let pause = self.incin.get_unchecked().pause();
+    let pause = self.incin.get_unchecked().pause(on_retry);
     // Safe because we paused properly.
     let insertion = unsafe {
       self.top.insert(
@@ -316,12 +326,12 @@ where
   /// correctly if [`Hash`] and [`Ord`] are implemented in the same way for
   /// the borrowed type and the stored type. If the entry was not found,
   /// `None` is returned.
-  pub fn remove<Q>(&self, key: &Q) -> Option<Removed<K, V>>
+  pub fn remove<Q>(&self, key: &Q, on_retry: impl FnMut()) -> Option<Removed<K, V>>
   where
     Q: ?Sized + Hash + Ord,
     K: Borrow<Q>,
   {
-    self.remove_with(key, |_| true)
+    self.remove_with(key, |_| true, on_retry)
   }
 
   /// Removes _interactively_ the entry identified by the given key. A closure
@@ -331,14 +341,19 @@ where
   /// method will only work correctly if [`Hash`] and [`Ord`] are implemented
   /// in the same way for the borrowed type and the stored type. If the
   /// entry was not found, [`None`] is returned.
-  pub fn remove_with<Q, F>(&self, key: &Q, interactive: F) -> Option<Removed<K, V>>
+  pub fn remove_with<Q, F>(
+    &self,
+    key: &Q,
+    interactive: F,
+    on_retry: impl FnMut(),
+  ) -> Option<Removed<K, V>>
   where
     Q: ?Sized + Hash + Ord,
     K: Borrow<Q>,
     F: FnMut(&(K, V)) -> bool,
   {
     let hash = self.hash_of(key);
-    let pause = self.incin.get_unchecked().pause();
+    let pause = self.incin.get_unchecked().pause(on_retry);
     // Safe because we paused properly.
     unsafe {
       self
@@ -348,13 +363,13 @@ where
   }
 
   /// Acts just like [`Extend::extend`] but does not require mutability.
-  pub fn extend<I>(&self, iterable: I)
+  pub fn extend<I>(&self, iterable: I, on_retry: impl FnMut() + Clone)
   where
     I: IntoIterator<Item = (K, V)>,
     K: Hash + Ord,
   {
     for (key, val) in iterable {
-      self.insert(key, val);
+      self.insert(key, val, on_retry.clone());
     }
   }
 
@@ -362,9 +377,7 @@ where
   where
     Q: ?Sized + Hash,
   {
-    let mut hasher = self.builder.build_hasher();
-    key.hash(&mut hasher);
-    hasher.finish()
+    self.builder.hash_one(key)
   }
 }
 
@@ -414,7 +427,7 @@ impl<'map, K, V, H> IntoIterator for &'map Map<K, V, H> {
   type IntoIter = Iter<'map, K, V>;
 
   fn into_iter(self) -> Self::IntoIter {
-    Iter::new(self.incin.get_unchecked().pause(), &self.top)
+    Iter::new(self.incin.get_unchecked().pause(noop), &self.top)
   }
 }
 
@@ -455,7 +468,7 @@ where
   where
     I: IntoIterator<Item = (K, V)>,
   {
-    (*self).extend(iterable)
+    (*self).extend(iterable, noop)
   }
 }
 
@@ -469,7 +482,7 @@ where
     I: IntoIterator<Item = (K, V)>,
   {
     let this = Self::default();
-    this.extend(iterable);
+    this.extend(iterable, noop);
     this
   }
 }
@@ -506,19 +519,22 @@ mod test {
   use super::*;
   use alloc::format;
   use alloc::sync::Arc;
-  use std::{collections::HashMap, thread};
+  use std::{
+    collections::HashMap,
+    thread::{self, yield_now},
+  };
 
   #[test]
   fn inserts_and_gets() {
     let map = Map::new();
-    assert!(map.get("five").is_none());
-    assert!(map.insert("five".to_owned(), 5).is_none());
-    assert_eq!(*map.get("five").unwrap().val(), 5);
-    assert!(map.get("four").is_none());
-    assert!(map.insert("four".to_owned(), 4).is_none());
-    assert_eq!(*map.get("five").unwrap().val(), 5);
-    assert_eq!(*map.get("four").unwrap().val(), 4);
-    let guard = map.get("four").unwrap();
+    assert!(map.get("five", yield_now).is_none());
+    assert!(map.insert("five".to_owned(), 5, yield_now).is_none());
+    assert_eq!(*map.get("five", yield_now).unwrap().val(), 5);
+    assert!(map.get("four", yield_now).is_none());
+    assert!(map.insert("four".to_owned(), 4, yield_now).is_none());
+    assert_eq!(*map.get("five", yield_now).unwrap().val(), 5);
+    assert_eq!(*map.get("four", yield_now).unwrap().val(), 4);
+    let guard = map.get("four", yield_now).unwrap();
     assert_eq!(guard.key(), "four");
     assert_eq!(*guard.val(), 4);
   }
@@ -527,19 +543,27 @@ mod test {
   fn create() {
     let map = Map::new();
     assert!(map
-      .insert_with("five".to_owned(), |_, _, stored| if stored.is_none() {
-        Preview::New(5)
-      } else {
-        Preview::Discard
-      },)
+      .insert_with(
+        "five".to_owned(),
+        |_, _, stored| if stored.is_none() {
+          Preview::New(5)
+        } else {
+          Preview::Discard
+        },
+        yield_now
+      )
       .created());
-    assert_eq!(*map.get("five").unwrap().val(), 5);
+    assert_eq!(*map.get("five", yield_now).unwrap().val(), 5);
     assert!(map
-      .insert_with("five".to_owned(), |_, _, stored| if stored.is_none() {
-        Preview::New(500)
-      } else {
-        Preview::Discard
-      },)
+      .insert_with(
+        "five".to_owned(),
+        |_, _, stored| if stored.is_none() {
+          Preview::New(500)
+        } else {
+          Preview::Discard
+        },
+        yield_now
+      )
       .failed()
       .is_some());
   }
@@ -548,41 +572,49 @@ mod test {
   fn update() {
     let map = Map::new();
     assert!(map
-      .insert_with("five".to_owned(), |_, _, stored| {
-        if let Some((_, n)) = stored {
-          Preview::New(*n + 6)
-        } else {
-          Preview::Discard
-        }
-      })
+      .insert_with(
+        "five".to_owned(),
+        |_, _, stored| {
+          if let Some((_, n)) = stored {
+            Preview::New(*n + 6)
+          } else {
+            Preview::Discard
+          }
+        },
+        yield_now
+      )
       .failed()
       .is_some());
-    assert!(map.insert("five".to_owned(), 5).is_none());
+    assert!(map.insert("five".to_owned(), 5, yield_now).is_none());
     let guard = map
-      .insert_with("five".to_owned(), |_, _, stored| {
-        if let Some((_, n)) = stored {
-          Preview::New(*n + 7)
-        } else {
-          Preview::Discard
-        }
-      })
+      .insert_with(
+        "five".to_owned(),
+        |_, _, stored| {
+          if let Some((_, n)) = stored {
+            Preview::New(*n + 7)
+          } else {
+            Preview::Discard
+          }
+        },
+        yield_now,
+      )
       .take_updated()
       .unwrap();
     assert_eq!(guard.key(), "five");
     assert_eq!(*guard.val(), 5);
-    assert_eq!(*map.get("five").unwrap().val(), 12);
+    assert_eq!(*map.get("five", yield_now).unwrap().val(), 12);
   }
 
   #[test]
   fn never_inserts() {
     let map = Map::new();
     assert!(map
-      .insert_with("five".to_owned(), |_, _, _| Preview::Discard)
+      .insert_with("five".to_owned(), |_, _, _| Preview::Discard, yield_now)
       .failed()
       .is_some());
-    assert!(map.insert("five".to_owned(), 5).is_none());
+    assert!(map.insert("five".to_owned(), 5, yield_now).is_none());
     assert!(map
-      .insert_with("five".to_owned(), |_, _, _| Preview::Discard)
+      .insert_with("five".to_owned(), |_, _, _| Preview::Discard, yield_now)
       .failed()
       .is_some());
   }
@@ -590,39 +622,45 @@ mod test {
   #[test]
   fn inserts_reinserts() {
     let map = Map::new();
-    assert!(map.insert("four".to_owned(), 4).is_none());
-    let prev = map.insert("four".to_owned(), 40).unwrap();
+    assert!(map.insert("four".to_owned(), 4, yield_now).is_none());
+    let prev = map.insert("four".to_owned(), 40, yield_now).unwrap();
     assert_eq!(prev.key(), "four");
     assert_eq!(*prev.val(), 4);
-    let prev = map.reinsert(prev).take_updated().unwrap();
+    let prev = map.reinsert(prev, yield_now).take_updated().unwrap();
     assert_eq!(prev.key(), "four");
     assert_eq!(*prev.val(), 40);
-    assert!(*map.get("four").unwrap().val() == 4);
+    assert!(*map.get("four", yield_now).unwrap().val() == 4);
   }
 
   #[test]
   fn never_reinserts() {
     let map = Map::new();
-    map.insert("five".to_owned(), 5);
-    let prev = map.remove("five").unwrap();
-    let prev = map.reinsert_with(prev, |_, _| false).take_failed().unwrap();
-    assert!(map.insert("five".to_owned(), 5).is_none());
-    map.reinsert_with(prev, |_, _| false).take_failed().unwrap();
+    map.insert("five".to_owned(), 5, yield_now);
+    let prev = map.remove("five", yield_now).unwrap();
+    let prev = map
+      .reinsert_with(prev, |_, _| false, yield_now)
+      .take_failed()
+      .unwrap();
+    assert!(map.insert("five".to_owned(), 5, yield_now).is_none());
+    map
+      .reinsert_with(prev, |_, _| false, yield_now)
+      .take_failed()
+      .unwrap();
   }
 
   #[test]
   fn reinserts_create() {
     let map = Map::new();
-    map.insert("five".to_owned(), 5);
-    let first = map.remove("five").unwrap();
-    map.insert("five".to_owned(), 5);
-    let second = map.remove("five").unwrap();
+    map.insert("five".to_owned(), 5, yield_now);
+    let first = map.remove("five", yield_now).unwrap();
+    map.insert("five".to_owned(), 5, yield_now);
+    let second = map.remove("five", yield_now).unwrap();
     assert!(map
-      .reinsert_with(first, |_, stored| stored.is_none())
+      .reinsert_with(first, |_, stored| stored.is_none(), yield_now)
       .created());
-    assert_eq!(*map.get("five").unwrap().val(), 5);
+    assert_eq!(*map.get("five", yield_now).unwrap().val(), 5);
     assert!(map
-      .reinsert_with(second, |_, stored| stored.is_none())
+      .reinsert_with(second, |_, stored| stored.is_none(), yield_now)
       .failed()
       .is_some());
   }
@@ -630,15 +668,15 @@ mod test {
   #[test]
   fn reinserts_update() {
     let map = Map::new();
-    map.insert("five".to_owned(), 5);
-    let prev = map.remove("five").unwrap();
+    map.insert("five".to_owned(), 5, yield_now);
+    let prev = map.remove("five", yield_now).unwrap();
     let prev = map
-      .reinsert_with(prev, |_, stored| stored.is_some())
+      .reinsert_with(prev, |_, stored| stored.is_some(), yield_now)
       .take_failed()
       .unwrap();
-    map.insert("five".to_owned(), 5);
+    map.insert("five".to_owned(), 5, yield_now);
     assert!(map
-      .reinsert_with(prev, |_, stored| stored.is_some())
+      .reinsert_with(prev, |_, stored| stored.is_some(), yield_now)
       .updated()
       .is_some());
   }
@@ -646,23 +684,23 @@ mod test {
   #[test]
   fn inserts_and_removes() {
     let map = Map::new();
-    assert!(map.remove("five").is_none());
-    assert!(map.remove("four").is_none());
-    map.insert("five".to_owned(), 5);
-    let removed = map.remove("five").unwrap();
+    assert!(map.remove("five", yield_now).is_none());
+    assert!(map.remove("four", yield_now).is_none());
+    map.insert("five".to_owned(), 5, yield_now);
+    let removed = map.remove("five", yield_now).unwrap();
     assert_eq!(removed.key(), "five");
     assert_eq!(*removed.val(), 5);
-    assert!(map.insert("four".to_owned(), 4).is_none());
-    map.insert("three".to_owned(), 3);
-    assert!(map.remove("two").is_none());
-    map.insert("two".to_owned(), 2);
-    let removed = map.remove("three").unwrap();
+    assert!(map.insert("four".to_owned(), 4, yield_now).is_none());
+    map.insert("three".to_owned(), 3, yield_now);
+    assert!(map.remove("two", yield_now).is_none());
+    map.insert("two".to_owned(), 2, yield_now);
+    let removed = map.remove("three", yield_now).unwrap();
     assert_eq!(removed.key(), "three");
     assert_eq!(*removed.val(), 3);
-    let removed = map.remove("two").unwrap();
+    let removed = map.remove("two", yield_now).unwrap();
     assert_eq!(removed.key(), "two");
     assert_eq!(*removed.val(), 2);
-    let removed = map.remove("four").unwrap();
+    let removed = map.remove("four", yield_now).unwrap();
     assert_eq!(removed.key(), "four");
     assert_eq!(*removed.val(), 4);
   }
@@ -670,19 +708,19 @@ mod test {
   #[test]
   fn repeated_inserts() {
     let map = Map::new();
-    assert!(map.insert("five".to_owned(), 5).is_none());
-    assert!(*map.insert("five".to_owned(), 5).unwrap().val() == 5);
+    assert!(map.insert("five".to_owned(), 5, yield_now).is_none());
+    assert!(*map.insert("five".to_owned(), 5, yield_now).unwrap().val() == 5);
   }
 
   #[test]
   fn reinsert_from_other_map_fails() {
     let other = Map::new();
-    other.insert(5, 3);
-    other.insert(0, 0);
-    let removed = other.remove(&5).unwrap();
-    let _active_read = other.get(&0).unwrap();
+    other.insert(5, 3, yield_now);
+    other.insert(0, 0, yield_now);
+    let removed = other.remove(&5, yield_now).unwrap();
+    let _active_read = other.get(&0, yield_now).unwrap();
     let map = Map::new();
-    map.reinsert(removed).failed().unwrap();
+    map.reinsert(removed, yield_now).failed().unwrap();
   }
 
   #[test]
@@ -690,7 +728,7 @@ mod test {
     let map = Map::new();
     for i in 0..10u128 {
       for j in 0..32 {
-        map.insert((i, j), i << j);
+        map.insert((i, j), i << j, yield_now);
       }
     }
 
@@ -714,13 +752,13 @@ mod test {
     let mut map = Map::new();
     for i in 0..200u128 {
       for j in 0..128 {
-        map.insert((i, j), i << j);
+        map.insert((i, j), i << j, yield_now);
       }
     }
 
     for i in 0..200 {
       for j in 0..16 {
-        map.remove(&(i, j));
+        map.remove(&(i, j), yield_now);
       }
     }
 
@@ -746,7 +784,7 @@ mod test {
     let mut map = Map::new();
     for i in 0..10u128 {
       for j in 0..32 {
-        map.insert((i, j), i << j);
+        map.insert((i, j), i << j, yield_now);
       }
     }
 
@@ -787,19 +825,24 @@ mod test {
       let map = map.clone();
       threads.push(thread::spawn(move || {
         let prev = map
-          .get(&format!("prefix{}suffix", i - 1))
+          .get(&format!("prefix{}suffix", i - 1), yield_now)
           .map_or(0, |guard| *guard.val());
-        map.insert(format!("prefix{}suffix", i), prev + i);
-        map.insert_with(format!("prefix{}suffix", i + 1), |_, _, stored| {
-          Preview::New(stored.map_or(0, |&(_, x)| x + i))
-        });
+        map.insert(format!("prefix{}suffix", i), prev + i, yield_now);
+        map.insert_with(
+          format!("prefix{}suffix", i + 1),
+          |_, _, stored| Preview::New(stored.map_or(0, |&(_, x)| x + i)),
+          yield_now,
+        );
       }));
     }
     for thread in threads {
       thread.join().expect("thread failed");
     }
     for i in 1i64..=20 {
-      let val = *map.get(&format!("prefix{}suffix", i)).unwrap().val();
+      let val = *map
+        .get(&format!("prefix{}suffix", i), yield_now)
+        .unwrap()
+        .val();
       assert!(val > 0);
     }
   }

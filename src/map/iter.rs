@@ -98,14 +98,14 @@ impl<'map, K, V> Iterator for Iter<'map, K, V> {
   }
 }
 
-unsafe impl<'map, K, V> Send for Iter<'map, K, V>
+unsafe impl<K, V> Send for Iter<'_, K, V>
 where
   K: Send,
   V: Send,
 {
 }
 
-unsafe impl<'map, K, V> Sync for Iter<'map, K, V>
+unsafe impl<K, V> Sync for Iter<'_, K, V>
 where
   K: Sync,
   V: Sync,
@@ -299,21 +299,21 @@ impl<'map, K, V> Iterator for IterMut<'map, K, V> {
   }
 }
 
-unsafe impl<'map, K, V> Send for IterMut<'map, K, V>
+unsafe impl<K, V> Send for IterMut<'_, K, V>
 where
   K: Send,
   V: Send,
 {
 }
 
-unsafe impl<'map, K, V> Sync for IterMut<'map, K, V>
+unsafe impl<K, V> Sync for IterMut<'_, K, V>
 where
   K: Sync,
   V: Sync,
 {
 }
 
-impl<'map, K, V> fmt::Debug for IterMut<'map, K, V> {
+impl<K, V> fmt::Debug for IterMut<'_, K, V> {
   fn fmt(&self, fmtr: &mut fmt::Formatter) -> fmt::Result {
     write!(
       fmtr,

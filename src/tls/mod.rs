@@ -557,7 +557,7 @@ impl<'tls, T> Iterator for IterMut<'tls, T> {
   }
 }
 
-impl<'tls, T> fmt::Debug for IterMut<'tls, T> {
+impl<T> fmt::Debug for IterMut<'_, T> {
   fn fmt(&self, fmtr: &mut fmt::Formatter) -> fmt::Result {
     write!(
       fmtr,

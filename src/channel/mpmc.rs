@@ -186,10 +186,10 @@ impl<T> Receiver<T> {
   /// [`Err`]`(`[`RecvErr::NoMessage`]`)` is returned. If the sender
   /// disconnected, [`Err`]`(`[`RecvErr::NoSender`]`)` is returned.
   #[allow(unused_must_use)]
-  pub fn recv(&self) -> Result<T, RecvErr> {
+  pub fn recv(&self, on_retry: impl FnMut()) -> Result<T, RecvErr> {
     // We need this because of the infamous ABA problem (and
     // use-after-free).
-    let pause = self.inner.incin.get_unchecked().pause();
+    let pause = self.inner.incin.get_unchecked().pause(on_retry);
 
     // Bypassing null check is safe because we never store null in
     // the front.
@@ -227,9 +227,9 @@ impl<T> Receiver<T> {
   /// but there are messages pending in the buffer. Note that another
   /// [`Receiver`] may pop out the pending messages after this method was
   /// called.
-  pub fn is_connected(&self) -> bool {
+  pub fn is_connected(&self, on_retry: impl FnMut()) -> bool {
     // We need this pause because of use-after-free.
-    let _pause = self.inner.incin.get_unchecked().pause();
+    let _pause = self.inner.incin.get_unchecked().pause(on_retry);
     // Safe to derefer this pointer because we paused the incinerator and we
     // only delete nodes via incinerator.
     let front = unsafe { &*self.inner.front.load(Relaxed) };
@@ -489,7 +489,7 @@ mod test {
   use alloc::vec::Vec;
   use core::sync::atomic::AtomicBool;
   use core::sync::atomic::Ordering::{AcqRel, Relaxed};
-  use std::thread;
+  use std::thread::{self, yield_now};
 
   #[test]
   fn correct_numbers() {
@@ -517,7 +517,7 @@ mod test {
       let receiver = receiver.clone();
       let done = done.clone();
       threads.push(thread::spawn(move || loop {
-        match receiver.recv() {
+        match receiver.recv(yield_now) {
           Ok(i) => assert!(!done[i].swap(true, AcqRel)),
 
           Err(mpmc::NoMessage) => (),

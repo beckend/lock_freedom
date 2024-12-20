@@ -1,3 +1,4 @@
+use crate::common::noop;
 use crate::owned_alloc::OwnedAlloc;
 use crate::{
   incin::Pause,
@@ -64,10 +65,10 @@ impl<T> Queue<T> {
     }
   }
 
-  /// Takes a value from the front of the queue, if it is avaible.
-  pub fn pop(&self) -> Option<T> {
+  /// Takes a value from the front of the queue, if it is available.
+  pub fn pop(&self, on_retry: impl FnMut()) -> Option<T> {
     // Pausing because of ABA problem involving remotion from linked lists.
-    let pause = self.incin.get_unchecked().pause();
+    let pause = self.incin.get_unchecked().pause(on_retry);
     let mut front_nnptr = unsafe {
       // The pointer stored in front and back must never be null. The
       // queue always have at least one node. Front and back are
@@ -247,15 +248,15 @@ where
   queue: &'queue Queue<T>,
 }
 
-impl<'queue, T> Iterator for PopIter<'queue, T> {
+impl<T> Iterator for PopIter<'_, T> {
   type Item = T;
 
   fn next(&mut self) -> Option<Self::Item> {
-    self.queue.pop()
+    self.queue.pop(noop)
   }
 }
 
-impl<'queue, T> fmt::Debug for PopIter<'queue, T> {
+impl<T> fmt::Debug for PopIter<'_, T> {
   fn fmt(&self, fmtr: &mut fmt::Formatter) -> fmt::Result {
     write!(fmtr, "PopIter {{ queue: {:?} }}", self.queue)
   }
@@ -295,11 +296,12 @@ mod test {
   use alloc::sync::Arc;
   use alloc::vec::Vec;
   use core::sync::atomic::AtomicUsize;
+  use std::thread::yield_now;
 
   #[test]
   fn on_empty_first_pop_is_none() {
     let queue = Queue::<usize>::new();
-    assert!(queue.pop().is_none());
+    assert!(queue.pop(yield_now).is_none());
   }
 
   #[test]
@@ -307,9 +309,10 @@ mod test {
     let queue = Queue::new();
     queue.push(3);
     queue.push(1234);
-    queue.pop();
-    queue.pop();
-    assert!(queue.pop().is_none());
+
+    queue.pop(yield_now);
+    queue.pop(yield_now);
+    assert!(queue.pop(yield_now).is_none());
   }
 
   #[test]
@@ -318,9 +321,9 @@ mod test {
     queue.push(3);
     queue.push(5);
     queue.push(6);
-    assert_eq!(queue.pop(), Some(3));
-    assert_eq!(queue.pop(), Some(5));
-    assert_eq!(queue.pop(), Some(6));
+    assert_eq!(queue.pop(yield_now), Some(3));
+    assert_eq!(queue.pop(yield_now), Some(5));
+    assert_eq!(queue.pop(yield_now), Some(6));
   }
 
   #[test]
@@ -338,7 +341,7 @@ mod test {
   #[cfg(feature = "std")]
   #[test]
   fn no_data_corruption() {
-    use std::thread;
+    use std::thread::{self, yield_now};
     const NTHREAD: usize = 20;
     const NITER: usize = 800;
     const NMOD: usize = 55;
@@ -355,7 +358,7 @@ mod test {
           let val = (i * NITER) + j;
           queue.push(val);
           if (val + 1) % NMOD == 0 {
-            if let Some(val) = queue.pop() {
+            if let Some(val) = queue.pop(yield_now) {
               removed.fetch_add(1, Relaxed);
               assert!(val < NITER * NTHREAD);
             }
@@ -370,7 +373,7 @@ mod test {
 
     let expected = NITER * NTHREAD - removed.load(Relaxed);
     let mut res = 0;
-    while let Some(val) = queue.pop() {
+    while let Some(val) = queue.pop(yield_now) {
       assert!(val < NITER * NTHREAD);
       res += 1;
     }

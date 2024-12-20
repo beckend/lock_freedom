@@ -32,6 +32,9 @@
 
 extern crate alloc;
 
+/// Common utilities.
+pub mod common;
+
 pub(crate) mod owned_alloc;
 /// Provides convenient re-exports.
 pub mod prelude;

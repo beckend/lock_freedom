@@ -45,7 +45,7 @@ impl<'map, K, V> ReadGuard<'map, K, V> {
   }
 }
 
-impl<'map, K, V> Deref for ReadGuard<'map, K, V> {
+impl<K, V> Deref for ReadGuard<'_, K, V> {
   type Target = (K, V);
 
   fn deref(&self) -> &Self::Target {
@@ -53,7 +53,7 @@ impl<'map, K, V> Deref for ReadGuard<'map, K, V> {
   }
 }
 
-impl<'map, K, V> PartialEq for ReadGuard<'map, K, V>
+impl<K, V> PartialEq for ReadGuard<'_, K, V>
 where
   (K, V): PartialEq,
 {
@@ -62,7 +62,7 @@ where
   }
 }
 
-impl<'map, K, V> PartialEq<(K, V)> for ReadGuard<'map, K, V>
+impl<K, V> PartialEq<(K, V)> for ReadGuard<'_, K, V>
 where
   (K, V): PartialEq,
 {
@@ -71,9 +71,9 @@ where
   }
 }
 
-impl<'map, K, V> Eq for ReadGuard<'map, K, V> where (K, V): Eq {}
+impl<K, V> Eq for ReadGuard<'_, K, V> where (K, V): Eq {}
 
-impl<'map, K, V> PartialOrd for ReadGuard<'map, K, V>
+impl<K, V> PartialOrd for ReadGuard<'_, K, V>
 where
   (K, V): PartialOrd,
 {
@@ -82,7 +82,7 @@ where
   }
 }
 
-impl<'map, K, V> PartialOrd<(K, V)> for ReadGuard<'map, K, V>
+impl<K, V> PartialOrd<(K, V)> for ReadGuard<'_, K, V>
 where
   (K, V): PartialOrd,
 {
@@ -91,7 +91,7 @@ where
   }
 }
 
-impl<'map, K, V> Ord for ReadGuard<'map, K, V>
+impl<K, V> Ord for ReadGuard<'_, K, V>
 where
   (K, V): Ord,
 {
@@ -100,7 +100,7 @@ where
   }
 }
 
-impl<'map, K, V> Hash for ReadGuard<'map, K, V>
+impl<K, V> Hash for ReadGuard<'_, K, V>
 where
   (K, V): Hash,
 {
@@ -112,26 +112,26 @@ where
   }
 }
 
-impl<'map, K, V> AsRef<(K, V)> for ReadGuard<'map, K, V> {
+impl<K, V> AsRef<(K, V)> for ReadGuard<'_, K, V> {
   fn as_ref(&self) -> &(K, V) {
     self
   }
 }
 
-impl<'map, K, V> Borrow<(K, V)> for ReadGuard<'map, K, V> {
+impl<K, V> Borrow<(K, V)> for ReadGuard<'_, K, V> {
   fn borrow(&self) -> &(K, V) {
     self
   }
 }
 
-unsafe impl<'map, K, V> Send for ReadGuard<'map, K, V>
+unsafe impl<K, V> Send for ReadGuard<'_, K, V>
 where
   K: Send,
   V: Send,
 {
 }
 
-unsafe impl<'map, K, V> Sync for ReadGuard<'map, K, V>
+unsafe impl<K, V> Sync for ReadGuard<'_, K, V>
 where
   K: Sync,
   V: Sync,
