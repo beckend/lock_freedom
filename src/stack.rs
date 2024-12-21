@@ -1,4 +1,4 @@
-use crate::{common::noop, guard_read_stack::GuardRead, owned_alloc::OwnedAlloc};
+use crate::{common::noop, guard_read_stack::GuardRead, incin::Pause, owned_alloc::OwnedAlloc};
 use core::{
   fmt,
   iter::FromIterator,
@@ -65,9 +65,16 @@ impl<T> Stack<T> {
   }
 
   /// Pops a single element from the top of the stack.
-  pub fn pop(&self, mut on_retry: impl FnMut() + Clone) -> Option<T> {
-    // We need this because of ABA problem and use-after-free.
-    let pause = self.incin.get_unchecked().pause(on_retry.clone());
+  pub fn pop(&self, on_retry: impl FnMut() + Clone) -> Option<T> {
+    self.pop_with_guard(self.incin.get_unchecked().pause(on_retry.clone()), on_retry)
+  }
+
+  /// Pops a single element from the top of the stack.
+  pub(crate) fn pop_with_guard(
+    &self,
+    pause: Pause<'_, OwnedAlloc<Node<T>>>,
+    mut on_retry: impl FnMut() + Clone,
+  ) -> Option<T> {
     // First, let's load our top.
     let mut top = self.top.load(Acquire);
 
@@ -125,7 +132,7 @@ impl<T> Stack<T> {
       {
         top = new_top;
       } else {
-        return Some(GuardRead::new(pause, nnptr));
+        return Some(GuardRead::new(self, pause, nnptr));
       }
 
       on_retry();
@@ -306,6 +313,19 @@ mod test {
     stack.pop(yield_now);
     assert_eq!(stack.len(), 1);
     stack.pop(yield_now);
+    assert_eq!(stack.len(), 0);
+  }
+
+  #[test]
+  fn pop_while_peeking() {
+    let stack = Stack::new();
+
+    stack.push(3);
+    assert_eq!(stack.len(), 1);
+
+    let guard = stack.top_peek(yield_now).expect("This must work.");
+    assert_eq!(stack.len(), 1);
+    assert_eq!(guard.pop(yield_now), 3);
     assert_eq!(stack.len(), 0);
   }
 

@@ -1,4 +1,8 @@
-use crate::{incin::Pause, owned_alloc::OwnedAlloc, stack::Node};
+use crate::{
+  incin::Pause,
+  owned_alloc::OwnedAlloc,
+  stack::{Node, Stack},
+};
 use core::ptr::NonNull;
 use std::ops::Deref;
 
@@ -9,13 +13,31 @@ pub struct GuardRead<'a, T> {
   /// The guard.
   pub(crate) guard: Pause<'a, OwnedAlloc<Node<T>>>,
   /// The node read guarded.
-  pub(crate) node: NonNull<Node<T>>,
+  pub(crate) inner: NonNull<Node<T>>,
+  /// The stack.
+  pub(crate) stack: &'a Stack<T>,
 }
 
 impl<'a, T> GuardRead<'a, T> {
   /// Creates a new instance.
-  pub(crate) fn new(guard: Pause<'a, OwnedAlloc<Node<T>>>, node: NonNull<Node<T>>) -> Self {
-    Self { guard, node }
+  pub(crate) fn new(
+    stack: &'a Stack<T>,
+    guard: Pause<'a, OwnedAlloc<Node<T>>>,
+    node: NonNull<Node<T>>,
+  ) -> Self {
+    Self {
+      guard,
+      inner: node,
+      stack,
+    }
+  }
+
+  /// Pops/takes the item from the stack while the guard is holding unto inner.
+  pub fn pop(self, on_retry: impl FnMut() + Clone) -> T {
+    self
+      .stack
+      .pop_with_guard(self.guard, on_retry)
+      .expect("Must have item since we are holding it's guard.")
   }
 }
 
@@ -23,7 +45,7 @@ impl<T> Deref for GuardRead<'_, T> {
   type Target = T;
 
   fn deref(&self) -> &Self::Target {
-    unsafe { &self.node.as_ref().val }
+    unsafe { &self.inner.as_ref().val }
   }
 }
 

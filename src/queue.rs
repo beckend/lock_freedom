@@ -74,9 +74,17 @@ impl<T> Queue<T> {
   }
 
   /// Takes a value from the front of the queue, if it is available.
-  pub fn pop(&self, mut on_retry: impl FnMut() + Clone) -> Option<T> {
+  pub fn pop(&self, on_retry: impl FnMut() + Clone) -> Option<T> {
+    self.pop_with_guard(self.incin.get_unchecked().pause(on_retry.clone()), on_retry)
+  }
+
+  /// Takes a value from the front of the queue, if it is available.
+  pub(crate) fn pop_with_guard(
+    &self,
+    pause: Pause<'_, OwnedAlloc<Node<T>>>,
+    mut on_retry: impl FnMut() + Clone,
+  ) -> Option<T> {
     // Pausing because of ABA problem involving remotion from linked lists.
-    let pause = self.incin.get_unchecked().pause(on_retry.clone());
     let mut front_nnptr = unsafe {
       // The pointer stored in front and back must never be null. The
       // queue always have at least one node. Front and back are
@@ -126,7 +134,7 @@ impl<T> Queue<T> {
       let has_item = unsafe { front_nnptr.as_ref().item.get_ref().is_some() };
 
       if has_item {
-        return GuardRead::new(pause, front_nnptr).into();
+        return GuardRead::new(self, pause, front_nnptr).into();
       }
 
       unsafe {
@@ -402,6 +410,20 @@ mod test {
     assert_eq!(*guard, 3);
     assert_eq!(instance.pop(yield_now), Some(3));
     assert_eq!(instance.pop(yield_now), Some(1234));
+    assert_eq!(instance.len(), 0);
+  }
+
+  #[test]
+  fn pop_while_peeking() {
+    let instance = Queue::new();
+
+    instance.push(3);
+    assert_eq!(instance.len(), 1);
+
+    let guard = instance.pop_peek(yield_now).expect("This must work.");
+    assert_eq!(instance.len(), 1);
+
+    assert_eq!(guard.pop(yield_now), 3);
     assert_eq!(instance.len(), 0);
   }
 
